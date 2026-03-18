@@ -509,6 +509,172 @@ detector = SOTAAIDetector(ensemble_dir="/path/to/ensemble_v6/")
 
 ---
 
+---
+
+## Step 4 — Calibration & Production Hardening
+
+This step runs **once after training completes**. It fits per-model temperature
+scaling on the saved test logits and enables the full false-positive protection
+layer for production use.
+
+### 4.1 — Why calibration matters
+
+Neural networks are systematically overconfident. A model that outputs
+`P(GPT) = 0.91` is not necessarily 91% reliable — it may be correct only 70%
+of the time at that threshold. Temperature scaling (Platt calibration) divides
+the logits by a learned scalar `T` before softmax, pulling probabilities toward
+their true empirical accuracy.
+
+In academic integrity contexts, a **false positive** (human accused of using AI)
+is significantly worse than a false negative. `CalibratedDetector` adds 5 layers
+of protection on top of the raw ensemble.
+
+### 4.2 — Run calibration (once, CPU or GPU)
+
+Requires Phase 4 to have completed — the `.npy` logit files must exist in
+`ensemble_dir`.
+```python
+from ensemble_v6_calibrated import calibrate_from_saved_logits
+
+calibrate_from_saved_logits(
+    "/content/drive/MyDrive/your_project/ensemble_v6/"
+)
+```
+
+Expected output:
+```
+============================================================
+TEMPERATURE CALIBRATION
+============================================================
+  [deberta]    Loaded (446257, 7)
+  [electra]    Loaded (446257, 7)
+  [modernbert] Loaded (446257, 7)
+
+Fitting per-model temperatures...
+  [deberta]    T = 1.2341
+  [electra]    T = 1.1876
+  [modernbert] T = 1.3102
+
+Fitting ensemble temperature...
+  [ensemble]   T = 1.1543
+
+Calibration saved to .../ensemble_v6/calibration.json
+CalibratedDetector will load this automatically on next init.
+```
+
+`calibration.json` is saved to `ensemble_dir` and loaded automatically by
+`CalibratedDetector` on every subsequent initialization.
+
+### 4.3 — File roles: detector_v6 vs CalibratedDetector
+
+| File | Role | Use when |
+|---|---|---|
+| `detector_v6.py` | Raw ensemble inference, direct probabilities | Development, debugging, experimentation |
+| `ensemble_v6_calibrated.py` | 5-layer false positive protection | **Production** |
+
+`CalibratedDetector` does not use `detector_v6.py` — it loads the three models
+directly and applies temperature scaling and gating internally.
+
+### 4.4 — Production inference with CalibratedDetector
+```python
+from ensemble_v6_calibrated import CalibratedDetector
+
+detector = CalibratedDetector(
+    ensemble_dir="/content/drive/MyDrive/your_project/ensemble_v6/",
+    fp_tolerance="strict",    # "strict" | "moderate" | "permissive"
+)
+```
+
+**Single text:**
+```python
+result = detector.classify("Text to analyze...")
+
+print(result["verdict"])              # "HUMAN" | "AI_DETECTED" | "INCONCLUSIVE"
+print(result["p_human"])              # 0.0 – 1.0
+print(result["p_ai_total"])           # 0.0 – 1.0
+print(result["safe_for_action"])      # True only in strict mode with full consensus
+print(result["ai_model"])             # "GPT" | "Claude" | "Gemini" | etc.
+print(result["agreement"])            # fraction of models that agree (0.33 | 0.67 | 1.0)
+print(result["flags"])                # list of human-readable gate reasons
+```
+
+**Full document (detects partially AI-written text):**
+```python
+doc = detector.classify_document("Full essay text here...")
+
+print(doc["verdict"])
+# "AI_DETECTED" | "MIXED_CONTENT" | "HUMAN" | "INSUFFICIENT_TEXT"
+
+print(doc["aggregation"]["ai_sentence_ratio"])    # e.g. 0.82
+print(doc["aggregation"]["dominant_ai_model"])    # e.g. "GPT"
+print(doc["aggregation"]["confidence"])           # "high" | "moderate" | "low"
+print(doc["safe_for_action"])                     # True only when strict + >85% AI sentences
+
+# Per-sentence breakdown
+for s in doc["sentence_verdicts"]:
+    print(s["text"][:60], "→", s["verdict"], f"P(AI)={s['p_ai']:.2f}")
+```
+
+**Batch:**
+```python
+results = detector.classify_batch(["text1", "text2", ...], batch_size=32)
+for r in results:
+    print(r["verdict"], r["p_human"])
+```
+
+### 4.5 — False positive tolerance profiles
+
+Choose the profile based on the consequences of a wrong accusation:
+
+| Profile | Min P(AI) | Model agreement | Use case |
+|---|---|---|---|
+| `strict` | 0.75 | **3/3 models** | Academic integrity, legal review |
+| `moderate` | 0.60 | 2/3 models | Content moderation, editorial review |
+| `permissive` | 0.45 | 1/3 models | Research, bulk screening |
+
+### 4.6 — 5-layer decision flow
+
+Every call to `classify()` passes through these gates in order:
+```
+Ensemble probs (temp-scaled)
+        ↓
+1. Inconclusive band check
+   If P(Human) ∈ [0.20, 0.55] → INCONCLUSIVE
+
+2. AI confidence threshold
+   If P(AI) < 0.75 (strict) → HUMAN
+
+3. Agreement gating
+   If fewer than 3/3 models vote AI (strict) → INCONCLUSIVE
+
+4. Margin check
+   If top-1 prob − top-2 prob < 0.25 → INCONCLUSIVE
+
+5. safe_for_action flag
+   Only True when: strict + 3/3 agreement + P(AI) > 0.85
+        ↓
+   HUMAN | AI_DETECTED | INCONCLUSIVE
+```
+
+`safe_for_action=True` is the signal that the system is confident enough to
+take consequential action (e.g. flagging a submission). `AI_DETECTED` with
+`safe_for_action=False` means the system suspects AI but does not have
+sufficient consensus for a formal accusation.
+
+### 4.7 — Required files after full pipeline
+```
+ensemble_v6/
+  ├── deberta_final/          ← trained by ensemble_v6_train.py
+  ├── electra_final/
+  ├── modernbert_final/
+  ├── deberta_logits.npy      ← saved by Phase 4
+  ├── electra_logits.npy
+  ├── modernbert_logits.npy
+  ├── deberta_labels.npy
+  ├── calibration.json        ← saved by calibrate_from_saved_logits()
+  ├── ensemble_metrics.json
+  └── ensemble_confusion_matrix.png
+```
 
 ## Configuration Reference
 
