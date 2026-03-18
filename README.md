@@ -18,6 +18,7 @@
 - [Step 1 — Preprocessing (CPU Runtime, 0 CU)](#step-1--preprocessing-cpu-runtime-0-cu)
 - [Step 2 — Training (H100 / A100 GPU)](#step-2--training-h100--a100-gpu)
 - [Step 3 — Inference](#step-3--inference)
+- [Step 4 — Calibration & Production Hardening](#step-4--calibration--production-hardening)
 - [Configuration Reference](#configuration-reference)
 - [Training Details](#training-details)
 - [Compute Budget](#compute-budget)
@@ -508,7 +509,10 @@ detector = SOTAAIDetector(ensemble_dir="/path/to/ensemble_v6/")
 
 ---
 
+
 ## Configuration Reference
+
+
 
 All configuration lives in `ensemble_v6_config.py`. Edit only this file — both `ensemble_v6_preprocess.py` and `ensemble_v6_train.py` import from it.
 
