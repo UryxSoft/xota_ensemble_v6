@@ -80,6 +80,169 @@ Input text
          ŷ = argmax P_ensemble
 ```
 
+# FIX B1: forensic_reports.py line ~300
+# BEFORE:
+from hallucination_profiler import HallucinationRiskClassifier
+# AFTER:
+from hallucination_profile import HallucinationRiskClassifier
+
+# FIX B2: detectot_final.py
+# Wrap all forward passes in:
+with torch.no_grad():
+    ...
+
+# FIX B3: detectot_final.py
+# BEFORE:
+torch.load(model1_path, map_location=device)
+# AFTER:
+torch.load(model1_path, map_location=device, weights_only=True)
+
+# FIX M1: rename one ParsedText to avoid collision
+# In reasoning_profiler.py: rename to ReasoningParsedText
+# In hallucination_profile.py: rename to HallucinationParsedText
+# (internal only — no public API surface affected)
+```
+
+### 8.6 Execution Order
+```
+Sequential (required for dependency resolution):
+  1. StylometricPlugin     (no deps, CPU, ~10ms)
+  2. ReasoningPlugin       (no deps, CPU, ~5ms)  
+  3. HallucinationPlugin   (no deps, CPU+optional spaCy, ~15ms)
+  4. WatermarkPlugin       (no deps, GPU/CPU, ~200ms first call, ~50ms cached)
+  5. ForensicPlugin        (requires 1+2+3+4, ~50ms + matplotlib if visuals)
+
+Parallelizable groups (1,2,3 can run concurrently; 4 independently):
+  Group A: [Stylometric, Reasoning, Hallucination]  — pure CPU, ThreadPoolExecutor safe
+  Group B: [Watermark]                              — GPU access, run after Group A completes
+  Group C: [Forensic]                               — depends on A+B
+```
+
+---
+
+## 9. Final Architecture Diagram
+```
+══════════════════════════════════════════════════════════════════════════
+                     XOTA ENSEMBLE v6 — INFERENCE PIPELINE
+══════════════════════════════════════════════════════════════════════════
+
+RAW TEXT INPUT
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  detectot_final.py  (ENTRYPOINT)                                    │
+│                                                                     │
+│  clean_text() ──► ModernBERT Tokenizer (shared, 512 max)           │
+│                         │                                           │
+│             ┌───────────┼───────────┬───────────┐                  │
+│             ▼           ▼           ▼           ▼                  │
+│         model_1      model_2      model_3     model_4              │
+│        (ModernBERT  (ModernBERT  (ModernBERT (ModernBERT           │
+│         41-class)   41-class)    41-class)   41-class)             │
+│             │           │           │           │                  │
+│             └─────── avg_softmax() ─────────────┘                  │
+│                         │                                           │
+│              probabilities: Tensor[41]                              │
+│                         │                                           │
+│              DetectorFinalAdapter()  ◄── [NEW: adapter]            │
+│              → prediction, confidence, raw_scores                   │
+└────────────────────────┬────────────────────────────────────────────┘
+                         │
+                         ▼
+              PluginContext(text, probabilities, ...)
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PLUGIN PIPELINE  (PluginPipeline.execute)                          │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GROUP A — Parallel CPU Plugins                              │    │
+│  │                                                             │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐               │    │
+│  │  │ StylometricPlugin │  │ ReasoningPlugin   │               │    │
+│  │  │                  │  │                  │               │    │
+│  │  │ StylometricPro-  │  │ ReasoningPro-    │               │    │
+│  │  │ filer.compute_   │  │ filer.vectorize()│               │    │
+│  │  │ stats(text)      │  │ → ndarray[15]    │               │    │
+│  │  │                  │  │ → ai_score scalar│               │    │
+│  │  │ → Dict[str,float]│  │                  │               │    │
+│  │  │   (11 keys)      │  │                  │               │    │
+│  │  └─────────┬────────┘  └────────┬─────────┘               │    │
+│  │            │                    │                           │    │
+│  │  ┌─────────▼────────────────────▼──────────┐               │    │
+│  │  │ HallucinationPlugin                      │               │    │
+│  │  │                                          │               │    │
+│  │  │ HallucinationProfiler.compute_stats()    │               │    │
+│  │  │ HallucinationRiskClassifier.classify()   │               │    │
+│  │  │ → {overall_risk, risk_level,            │               │    │
+│  │  │    category_scores[8], top_signals[3]}   │               │    │
+│  │  └─────────────────────────────────────────┘               │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                         │                                           │
+│  ┌──────────────────────▼──────────────────────────────────────┐    │
+│  │ GROUP B — GPU Plugin                                        │    │
+│  │                                                             │    │
+│  │  ┌────────────────────────────────────────┐                 │    │
+│  │  │ WatermarkPlugin                         │                 │    │
+│  │  │                                         │                 │    │
+│  │  │ WatermarkDecoder.detect(text)           │                 │    │
+│  │  │  ├─ GreenRedListDecoder  (CPU)          │                 │    │
+│  │  │  └─ EntropyAnalyzer  (GPT-2, GPU/CPU)  │                 │    │
+│  │  │                                         │                 │    │
+│  │  │ → WatermarkSignature.to_forensic_dict() │                 │    │
+│  │  │   {detected, confidence, scheme_type,   │                 │    │
+│  │  │    z_score, p_value, green_fraction}    │                 │    │
+│  │  └────────────────────────────────────────┘                 │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                         │                                           │
+│  ┌──────────────────────▼──────────────────────────────────────┐    │
+│  │ GROUP C — Aggregation Plugin                                │    │
+│  │                                                             │    │
+│  │  ┌──────────────────────────────────────────────────────┐   │    │
+│  │  │ ForensicPlugin                                        │   │    │
+│  │  │                                                       │   │    │
+│  │  │ ForensicReportGenerator.generate_report(             │   │    │
+│  │  │   text,                                              │   │    │
+│  │  │   detection_result=DetectorFinalAdapter,             │   │    │
+│  │  │   additional_analyses={                              │   │    │
+│  │  │     "statistical":   ← StylometricPlugin output      │   │    │
+│  │  │     "reasoning":     ← ReasoningPlugin output        │   │    │
+│  │  │     "hallucination": ← HallucinationPlugin output    │   │    │
+│  │  │     "watermark":     ← WatermarkPlugin output        │   │    │
+│  │  │   }                                                  │   │    │
+│  │  │ ) → ForensicReport                                    │   │    │
+│  │  └──────────────────────────────────────────────────────┘   │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              UnifiedDetectionResult
+              ┌────────────────────────────────┐
+              │ prediction: str                │
+              │ confidence: float              │
+              │ top_ai_model: str              │
+              │ stylometric: Dict              │
+              │ reasoning_vector: List[float]  │
+              │ reasoning_ai_score: float      │
+              │ hallucination_risk: Dict       │
+              │ watermark: Dict                │
+              │ forensic_report: ForensicReport│
+              │ plugin_errors: Dict            │
+              └────────────────────────────────┘
+                         │
+              ┌──────────┴───────────┐
+              ▼                      ▼
+        Gradio UI             JSON/HTML Export
+   (result_message,          (report.export_html /
+    plt.Figure)               export_json)
+
+══════════════════════════════════════════════════════════════════════════
+LEGEND:
+  ── Sequential data flow
+  [NEW: ...] Requires new code
+  ← Input source annotation
+══════════════════════════════════════════════════════════════════════════
+
 ### Loss Function
 
 Each training step combines two losses:
