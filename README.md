@@ -122,6 +122,7 @@ Parallelizable groups (1,2,3 can run concurrently; 4 independently):
 
 ## 9. Final Architecture Diagram
 ```
+```
 ══════════════════════════════════════════════════════════════════════════
                      XOTA ENSEMBLE v6 — INFERENCE PIPELINE
 ══════════════════════════════════════════════════════════════════════════
@@ -242,7 +243,7 @@ LEGEND:
   [NEW: ...] Requires new code
   ← Input source annotation
 ══════════════════════════════════════════════════════════════════════════
-
+```
 ### Loss Function
 
 Each training step combines two losses:
