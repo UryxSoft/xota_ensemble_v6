@@ -668,7 +668,11 @@ def _generate_executive_summary(report: ForensicReport) -> str:
         if all_words:
             avg_word = float(np.mean([w.ai_score for w in all_words]))
             ai_words = sum(1 for w in all_words if w.ai_score > 0.7)
-            total_w  = len(all_words)
+            # [FIX v3.7] Use report.word_count (from text.split()) as canonical
+            # count for consistency with the header. word_attributions can
+            # tokenize differently (e.g. splitting punctuation).
+            total_w  = report.word_count
+            ai_words = min(ai_words, total_w)  # cap to prevent "178 of 177"
             ai_indicator_count = sum(
                 1 for w in all_words if w.features.get("ai_indicator")
             )
@@ -700,13 +704,15 @@ def _generate_executive_summary(report: ForensicReport) -> str:
 
             if ai_indicator_count > 0:
                 parts.append(
-                    f"The text contains {ai_indicator_count} words commonly associated "
+                    f"The text contains {ai_indicator_count} "
+                    f"{'word' if ai_indicator_count == 1 else 'words'} commonly associated "
                     f"with AI writing (such as 'furthermore', 'utilize', 'comprehensive')."
                 )
             if human_indicator_count > 0:
                 parts.append(
                     f"The text contains {human_indicator_count} informal or colloquial "
-                    f"words typically associated with human writing."
+                    f"{'word' if human_indicator_count == 1 else 'words'} typically "
+                    f"associated with human writing."
                 )
             if ai_indicator_count == 0 and human_indicator_count == 0:
                 parts.append(
