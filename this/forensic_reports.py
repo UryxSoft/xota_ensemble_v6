@@ -62,6 +62,7 @@ class ForensicReport:
     reasoning_analysis: Optional[Dict[str, Any]] = None
     stylometric_stats: Optional[Dict[str, float]] = None   # [NEW v3.5]
     perplexity_analysis: Optional[Dict[str, Any]] = None   # [NEW v3.7]
+    reference_analysis: Optional[Dict[str, Any]] = None    # [NEW v3.8]
     executive_summary: Optional[str] = None                 # [NEW v3.5]
     heatmap_b64: Optional[str] = None
     confidence_chart_b64: Optional[str] = None
@@ -1046,6 +1047,54 @@ def _generate_executive_summary(report: ForensicReport) -> str:
             )
 
     # ══════════════════════════════════════════════════════════════════
+    # 7c. CITATION VALIDATION [NEW v3.8]
+    # ══════════════════════════════════════════════════════════════════
+    if report.reference_analysis:
+        ra = report.reference_analysis
+        ra_total = int(ra.get("total_references", 0))
+        ra_score = ra.get("ai_score", 0.0)
+        ra_level = ra.get("risk_level", "")
+        fab_ratio = ra.get("fabricated_ratio", 0.0) if isinstance(ra.get("fabricated_ratio"), (int, float)) else 0.0
+        chim_ratio = ra.get("chimeric_ratio", 0.0) if isinstance(ra.get("chimeric_ratio"), (int, float)) else 0.0
+        orn_ratio = ra.get("ornamental_ratio", 0.0) if isinstance(ra.get("ornamental_ratio"), (int, float)) else 0.0
+
+        if ra_total > 0:
+            if "HIGH" in ra_level:
+                parts.append(
+                    f"CITATION VALIDATION: CRITICAL — Of {ra_total} references "
+                    f"checked against academic databases, {fab_ratio:.0%} could not "
+                    f"be found. Fabricated citations are strong binary evidence of "
+                    f"AI involvement — a paper either exists in CrossRef/OpenAlex "
+                    f"or it doesn't. This is the most actionable finding in the report."
+                )
+                if chim_ratio > 0:
+                    parts.append(
+                        f"Additionally, {chim_ratio:.0%} of references appear chimeric "
+                        f"— the title matches a real paper but the authors don't "
+                        f"correspond, suggesting AI mixed elements from multiple sources."
+                    )
+            elif "MEDIUM" in ra_level:
+                parts.append(
+                    f"CITATION VALIDATION: Of {ra_total} references, some could not "
+                    f"be fully verified (fabricated: {fab_ratio:.0%}, ornamental: "
+                    f"{orn_ratio:.0%}). This may indicate AI-assisted writing or "
+                    f"citation errors. Manual verification recommended."
+                )
+            else:
+                parts.append(
+                    f"CITATION VALIDATION: All {ra_total} references verified with "
+                    f"high confidence against academic databases (CrossRef, Semantic "
+                    f"Scholar, OpenAlex). Citations appear legitimate."
+                )
+
+            if orn_ratio > 0.3:
+                parts.append(
+                    f"Note: {orn_ratio:.0%} of references appear in the bibliography "
+                    f"but are never cited in the text body — a pattern characteristic "
+                    f"of AI-generated decorative reference lists."
+                )
+
+    # ══════════════════════════════════════════════════════════════════
     # 8. KEY EVIDENCE SUMMARY
     # ══════════════════════════════════════════════════════════════════
     if report.evidence_points:
@@ -1067,6 +1116,9 @@ def _generate_executive_summary(report: ForensicReport) -> str:
             "human_writing_indicators": "human writing indicators",
             "high_perplexity_ai_signal": "AI perplexity signature",
             "perplexity_valley_detected": "perplexity-based hybrid detection",
+            "fabricated_citations_detected": "fabricated citations",
+            "chimeric_citations_detected": "chimeric citations (mixed sources)",
+            "ornamental_references": "ornamental references (uncited bibliography)",
         }
         found_labels = [type_labels.get(t, t.replace("_", " ")) for t in ev_types]
         parts.append(
@@ -1354,6 +1406,48 @@ class ForensicReportGenerator:
         # [NEW v3.7] Extract perplexity analysis
         perplexity_analysis = additional.get("perplexity")
 
+        # [NEW v3.8] Extract reference analysis + add evidence
+        reference_analysis = additional.get("references")
+        if reference_analysis:
+            fab_ratio = reference_analysis.get("fabricated_ratio", 0.0)
+            chim_ratio = reference_analysis.get("chimeric_ratio", 0.0)
+            orn_ratio = reference_analysis.get("ornamental_ratio", 0.0)
+            total_refs = int(reference_analysis.get("total_references", 0))
+            ref_level = reference_analysis.get("risk_level", "")
+
+            if "HIGH" in ref_level:
+                evidence_points.append({
+                    "type": "fabricated_citations_detected",
+                    "fabricated_ratio": fab_ratio,
+                    "total_references": total_refs,
+                    "explanation": (
+                        f"CRITICAL: {fab_ratio:.0%} of {total_refs} references could "
+                        f"not be found in academic databases (CrossRef, Semantic Scholar, "
+                        f"OpenAlex). Fabricated citations are strong evidence of AI involvement."
+                    ),
+                })
+            if chim_ratio > 0:
+                evidence_points.append({
+                    "type": "chimeric_citations_detected",
+                    "chimeric_ratio": chim_ratio,
+                    "explanation": (
+                        f"{chim_ratio:.0%} of references appear chimeric — the title matches "
+                        f"a real paper but the authors don't correspond. This is a hallmark "
+                        f"of AI citation fabrication where elements from multiple papers "
+                        f"are combined into a single fictitious reference."
+                    ),
+                })
+            if orn_ratio > 0.3:
+                evidence_points.append({
+                    "type": "ornamental_references",
+                    "ornamental_ratio": orn_ratio,
+                    "explanation": (
+                        f"{orn_ratio:.0%} of bibliography entries are never cited in the "
+                        f"text body. AI often generates decorative reference lists that "
+                        f"look legitimate but are not integrated with the text."
+                    ),
+                })
+
         report_id = hashlib.md5(f"{text[:100]}{datetime.now().isoformat()}".encode()).hexdigest()[:12].upper()
         report = ForensicReport(
             report_id=report_id, generated_at=datetime.now().isoformat(),
@@ -1366,6 +1460,7 @@ class ForensicReportGenerator:
             hallucination_risk=hallucination_risk, reasoning_analysis=reasoning_analysis,
             stylometric_stats=stylometric_stats,
             perplexity_analysis=perplexity_analysis,
+            reference_analysis=reference_analysis,
         )
 
         # [NEW v3.5] Generate executive summary
@@ -1861,6 +1956,113 @@ Engine: {tier}</em></p>
 </div>
 """
 
+    # ── [NEW v3.8] Build reference validation HTML section ─────────
+
+    def _build_reference_html(self, reference_analysis):
+        if not reference_analysis: return ""
+        ra = reference_analysis
+        score = ra.get("ai_score", 0.0)
+        risk_level = ra.get("risk_level", "N/A")
+        interp = ra.get("interpretation", "")
+        total = ra.get("total_references", 0)
+        vrs = ra.get("validation_results", [])
+        fd = ra.get("feature_details", {})
+
+        if total == 0:
+            return ""
+
+        if "HIGH" in risk_level:   rf, rb, rb2 = "#c0392b", "#fff0ee", "#e74c3c"
+        elif "MEDIUM" in risk_level: rf, rb, rb2 = "#856404", "#fff8e1", "#f39c12"
+        elif "NO REF" in risk_level: rf, rb, rb2 = "#7f8c8d", "#f5f5f5", "#95a5a6"
+        else:                        rf, rb, rb2 = "#1e8449", "#eafaf1", "#27ae60"
+
+        # Feature detail rows
+        frows = ""
+        for feat, det in fd.items():
+            fg, bg = self._level_colors(det.get("level", "low"))
+            expl = (det.get("explanation") or "")[:280]
+            frows += (f'<tr class="hoverable-row">'
+                      f'<td><strong>{det.get("display_name", feat)}</strong></td>'
+                      f'<td style="text-align:right;font-family:monospace;">'
+                      f'{det.get("value", 0):.2%}</td>'
+                      f'<td style="background:{bg};color:{fg};text-align:center;'
+                      f'font-weight:bold;">{det.get("level", "").upper()}</td>'
+                      f'<td style="font-size:12px;">{expl}</td></tr>\n')
+
+        # Per-reference validation rows
+        ref_rows = ""
+        for v in vrs[:15]:  # cap at 15
+            status = v.get("status", "?")
+            sc = v.get("confidence_score", 0)
+            title = v.get("title", "")[:80]
+            authors = ", ".join(v.get("authors", [])[:3])
+            year = v.get("year", "?")
+            issues = "; ".join(v.get("issues", [])[:2])
+
+            if status == "verified":
+                sc_color, st_badge = "#27ae60", "VERIFIED"
+            elif status == "partial":
+                sc_color, st_badge = "#f39c12", "PARTIAL"
+            elif status == "chimeric":
+                sc_color, st_badge = "#8e44ad", "CHIMERIC"
+            elif status == "not_found":
+                sc_color, st_badge = "#e74c3c", "NOT FOUND"
+            else:
+                sc_color, st_badge = "#7f8c8d", status.upper()
+
+            orn = " 🎭" if v.get("is_ornamental") else ""
+            date_flag = " ⏰" if v.get("date_anomaly") else ""
+
+            ref_rows += (
+                f'<tr class="hoverable-row">'
+                f'<td style="font-size:12px;"><strong>{title}</strong>'
+                f'<br><small style="color:#7f8c8d;">{authors} ({year})</small></td>'
+                f'<td style="text-align:center;color:{sc_color};font-weight:bold;">'
+                f'{st_badge}{orn}{date_flag}</td>'
+                f'<td style="text-align:right;font-family:monospace;">{sc:.0f}</td>'
+                f'<td style="font-size:11px;">{issues}</td></tr>\n'
+            )
+
+        return f"""
+<h2 class="section-header" onclick="toggleSection('reference-section')">
+  Citation &amp; Reference Validation <span class="toggle-icon">&#9660;</span>
+</h2>
+<div id="reference-section" class="collapsible-section">
+<div class="disclaimer" style="background:#fff0f5; border:2px solid #e74c3c; color:#5a1a1a;">
+  <strong>CITATION VERIFICATION — CrossRef / Semantic Scholar / OpenAlex</strong><br>
+  Validates whether cited references exist in academic databases. Fabricated citations are
+  strong binary evidence of AI involvement — a paper either exists or it doesn't.
+  Based on CheckIfExist (2026), SemanticCite (2025), and Spinellis (2025) research.
+</div>
+<div style="text-align:center; margin:20px 0;">
+  <div class="metric" style="width:220px;">
+    <div class="metric-value" style="color:{rf};">{score:.1%}</div>
+    <div class="metric-label">Citation Risk Score</div>
+  </div>
+  <div class="metric" style="width:330px; background:{rb}; border:2px solid {rb2};">
+    <div class="metric-value" style="color:{rf}; font-size:16px;">{risk_level}</div>
+    <div class="metric-label">Classification ({total} references)</div>
+  </div>
+</div>
+<p><strong>Professional Interpretation:</strong><br>{interp}</p>
+<h3>Risk Feature Analysis</h3>
+<table class="interactive-table">
+  <thead><tr><th style="width:22%;">Feature</th><th style="width:10%;">Value</th>
+  <th style="width:8%;">Level</th><th>What This Means</th></tr></thead>
+  <tbody>{frows}</tbody>
+</table>
+<h3>Per-Reference Verification ({total} references)</h3>
+<p style="color:#7f8c8d;font-size:12px;">
+🎭 = Ornamental (in bibliography but not cited in text) &nbsp;|&nbsp;
+⏰ = Date anomaly (future or implausible year)</p>
+<table class="interactive-table">
+  <thead><tr><th>Reference</th><th style="width:12%;">Status</th>
+  <th style="width:8%;">Score</th><th>Issues</th></tr></thead>
+  <tbody>{ref_rows}</tbody>
+</table>
+</div>
+"""
+
     # ── [NEW v3.5] Build executive summary HTML ──────────────────────
 
     def _build_executive_summary_html(self, summary):
@@ -1941,6 +2143,7 @@ Engine: {tier}</em></p>
         rsn_sec  = self._build_reasoning_html(report.reasoning_analysis)
         styl_sec = self._build_stylometric_html(report.stylometric_stats)
         ppl_sec  = self._build_perplexity_html(report.perplexity_analysis)
+        ref_sec  = self._build_reference_html(report.reference_analysis)
         exec_sec = self._build_executive_summary_html(report.executive_summary)
 
         # ── Score cards with animated gauges ──
@@ -1961,11 +2164,17 @@ Engine: {tier}</em></p>
         if report.perplexity_analysis:
             ppl_gauge_score = report.perplexity_analysis.get("ai_score", 0.0)
 
+        # [NEW v3.8] Extract reference score for gauge
+        ref_gauge_score = 0.0
+        if report.reference_analysis:
+            ref_gauge_score = report.reference_analysis.get("ai_score", 0.0)
+
         score_cards = (
             _gauge(report.neural_score, "Neural Score")
             + _gauge(report.statistical_score, "Statistical")
             + _gauge(report.reasoning_score, "Reasoning")
             + _gauge(ppl_gauge_score, "Perplexity")
+            + _gauge(ref_gauge_score, "Citations")
             + _gauge(report.watermark_score, "Watermark")
         )
 
@@ -2127,6 +2336,9 @@ th{{background:linear-gradient(135deg,#2c3e50,#34495e);color:white;font-weight:6
 <!-- Perplexity Analysis [NEW v3.7] -->
 {ppl_sec}
 
+<!-- Reference Validation [NEW v3.8] -->
+{ref_sec}
+
 <!-- Key Evidence -->
 <h2 class="section-header" onclick="toggleSection('evidence-section')">
   Key Evidence <span class="toggle-icon">&#9660;</span>
@@ -2147,7 +2359,7 @@ th{{background:linear-gradient(135deg,#2c3e50,#34495e);color:white;font-weight:6
 
 <!-- Footer -->
 <div class="footer">
-  <p>XplagiaX SOTA AI Detector v3.7 | Word Count: {report.word_count} | {report.generated_at}</p>
+  <p>XplagiaX SOTA AI Detector v3.8 | Word Count: {report.word_count} | {report.generated_at}</p>
   <p>{_FORENSIC_DISCLAIMER}</p>
 </div>
 
@@ -2182,7 +2394,8 @@ function toggleSection(id) {{
             "scores": {"neural": report.neural_score, "statistical": report.statistical_score,
                 "stylometric": report.stylometric_score, "reasoning": report.reasoning_score,
                 "watermark": report.watermark_score,
-                "perplexity": report.perplexity_analysis.get("ai_score", 0.0) if report.perplexity_analysis else 0.0},
+                "perplexity": report.perplexity_analysis.get("ai_score", 0.0) if report.perplexity_analysis else 0.0,
+                "references": report.reference_analysis.get("ai_score", 0.0) if report.reference_analysis else 0.0},
             "evidence_points": report.evidence_points,
             "hallucination_risk": report.hallucination_risk,
             "stylometric_stats": report.stylometric_stats,
@@ -2209,6 +2422,15 @@ function toggleSection(id) {{
                 "interpretation": pa.get("interpretation", ""),
                 "feature_values": pa.get("feature_values", {}),
                 "window_count": pa.get("window_count", 0),
+            }
+        if report.reference_analysis is not None:
+            rfa = report.reference_analysis
+            data["reference_analysis"] = {
+                "ai_score": rfa.get("ai_score", 0.0),
+                "risk_level": rfa.get("risk_level", "N/A"),
+                "total_references": rfa.get("total_references", 0),
+                "interpretation": rfa.get("interpretation", ""),
+                "validation_results": rfa.get("validation_results", []),
             }
         with open(output_path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
         logger.info("JSON report exported: %s", output_path)

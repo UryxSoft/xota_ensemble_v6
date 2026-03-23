@@ -152,38 +152,25 @@ class ValidationResult:
 
 
 # ============================================================================
-# STRING SIMILARITY (Levenshtein — from CheckIfExist methodology)
+# STRING SIMILARITY (C-optimized via difflib)
 # ============================================================================
 
-def _levenshtein_ratio(s1: str, s2: str) -> float:
+from difflib import SequenceMatcher
+
+
+def _similarity_ratio(s1: str, s2: str) -> float:
     """
-    Levenshtein similarity ratio [0, 1].
-    1.0 = identical, 0.0 = completely different.
+    String similarity ratio [0, 1] using SequenceMatcher (C-backed).
+
+    [FIX v1.1] Replaced manual O(n*m) Levenshtein matrix with
+    difflib.SequenceMatcher.ratio() — orders of magnitude faster,
+    no memory allocation for 2D matrix per comparison.
     """
     if not s1 and not s2:
         return 1.0
     if not s1 or not s2:
         return 0.0
-
-    len1, len2 = len(s1), len(s2)
-    matrix = [[0] * (len2 + 1) for _ in range(len1 + 1)]
-
-    for i in range(len1 + 1):
-        matrix[i][0] = i
-    for j in range(len2 + 1):
-        matrix[0][j] = j
-
-    for i in range(1, len1 + 1):
-        for j in range(1, len2 + 1):
-            cost = 0 if s1[i - 1] == s2[j - 1] else 1
-            matrix[i][j] = min(
-                matrix[i - 1][j] + 1,
-                matrix[i][j - 1] + 1,
-                matrix[i - 1][j - 1] + cost,
-            )
-
-    max_len = max(len1, len2)
-    return 1.0 - (matrix[len1][len2] / max_len) if max_len > 0 else 1.0
+    return SequenceMatcher(None, s1, s2).ratio()
 
 
 def _normalize_text(text: str) -> str:
@@ -234,23 +221,27 @@ class ReferenceExtractor:
 
     Supports: APA, MLA, Chicago, numbered references, inline citations.
     Does NOT use GROBID or anystyle (pure regex, CPU-only).
+
+    [FIX v1.1] APA regex simplified to avoid ReDoS (catastrophic backtracking).
+    Captures authors-block greedily up to "(YYYY)." then parses authors
+    with string functions instead of nested regex groups.
     """
 
     # ── Bibliography section patterns ─────────────────────────────
-    # Match "References", "Bibliography", "Works Cited", etc.
     _BIB_HEADER = re.compile(
         r'^\s*(?:References|Bibliography|Works?\s+Cited|Literature|'
         r'Bibliograf[íi]a|R[ée]f[ée]rences)\s*$',
         re.IGNORECASE | re.MULTILINE,
     )
 
-    # APA-style: Author, A. B. (2023). Title. Journal, vol(num), pages.
+    # [FIX v1.1] ReDoS-safe APA regex.
+    # Strategy: capture everything before "(YYYY)." as the author block,
+    # then parse authors with string functions (no nested quantifiers).
+    # Matches: "Anything here (2023). Title sentence."
     _APA_REF = re.compile(
-        r'([A-Z][a-zA-Z\-]+(?:\s*,\s*[A-Z]\.(?:\s*[A-Z]\.)*)'
-        r'(?:\s*(?:,|&|and)\s*[A-Z][a-zA-Z\-]+(?:\s*,\s*[A-Z]\.(?:\s*[A-Z]\.)*)*)*'
-        r'(?:\s*et\s+al\.?)?)'       # Authors
-        r'\s*\((\d{4})\)\.\s*'        # (Year).
-        r'([^.]+\.)',                  # Title.
+        r'^(.{5,300}?)\s*'           # Author block (5-300 chars, non-greedy)
+        r'\((\d{4}[a-z]?)\)\.\s*'    # (Year).
+        r'([^.]{5,500}\.)',           # Title (at least 5 chars, up to first period)
         re.MULTILINE,
     )
 
@@ -266,10 +257,18 @@ class ReferenceExtractor:
         re.IGNORECASE,
     )
 
-    # Inline citations: (Smith, 2023), (Smith & Doe, 2023), (Smith et al., 2023)
-    _INLINE_CITATION = re.compile(
-        r'\(([A-Z][a-zA-Z\-]+(?:\s*(?:&|and|et\s+al\.?|,)\s*'
-        r'[A-Z]?[a-zA-Z\-]*)*\s*,?\s*\d{4}[a-z]?)\)',
+    # [FIX v1.1] Inline citations — two patterns:
+    # Pattern A: "(Smith, 2023)" / "(Smith & Doe, 2023)" / "(Smith et al., 2023)"
+    _INLINE_PAREN = re.compile(
+        r'\(([A-Z][a-zA-Z\-]+[^()]{0,60}?\d{4}[a-z]?)\)',
+    )
+    # Pattern B: "Smith (2023)" / "Smith et al. (2024)" / "Smith and Doe (2022)"
+    # [FIX v1.1] Removed inner \s+ that consumed the space before "("
+    _INLINE_AUTHOR_YEAR = re.compile(
+        r'([A-Z][a-zA-Z\-]+'                          # Primary author surname
+        r'(?:\s+et\s+al\.?)?'                          # Optional "et al."
+        r'(?:\s+(?:and|&)\s+[A-Z][a-zA-Z\-]+)?)'      # Optional second author
+        r'\s*\((\d{4}[a-z]?)\)',                        # (Year)
     )
 
     # Year extraction
@@ -279,14 +278,10 @@ class ReferenceExtractor:
         """
         Extract references from text.
 
-        Returns
-        -------
-        (bibliography_refs, inline_citations)
-            bibliography_refs: ParsedReference objects from the reference section
-            inline_citations: raw inline citation strings found in text body
+        Returns (bibliography_refs, inline_citations).
         """
-        refs = []
-        inline_cites = []
+        refs: List[ParsedReference] = []
+        inline_cites: List[str] = []
 
         # ── Find bibliography section ─────────────────────────────
         bib_match = self._BIB_HEADER.search(text)
@@ -294,20 +289,49 @@ class ReferenceExtractor:
             bib_text = text[bib_match.end():]
             body_text = text[:bib_match.start()]
         else:
-            # No explicit bibliography header — try the last 30% of text
-            split_point = int(len(text) * 0.7)
-            bib_text = text[split_point:]
-            body_text = text
+            # [FIX v1.2] Also try to find "References" inline (not on its own line).
+            # Search from 30% onwards to avoid false matches in body text.
+            # Use finditer to get the LAST match (closest to end = most likely the bib).
+            search_start = int(len(text) * 0.3)
+            inline_matches = list(re.finditer(
+                r'\b(?:References|Bibliography|Works?\s+Cited)\b',
+                text[search_start:],
+                re.IGNORECASE,
+            ))
+            if inline_matches:
+                last_match = inline_matches[-1]  # take last occurrence
+                abs_pos = search_start + last_match.end()
+                bib_text = text[abs_pos:]
+                body_text = text[:search_start + last_match.start()]
+            else:
+                split_point = int(len(text) * 0.7)
+                bib_text = text[split_point:]
+                body_text = text
+
+        # [FIX v1.2] Strip any residual header text from start of bib_text.
+        # Handles cases like "References\nNguyen..." or "References Nguyen..."
+        bib_text = re.sub(
+            r'^\s*(?:References|Bibliography|Works?\s+Cited|Literature'
+            r'|Bibliograf[íi]a|R[ée]f[ée]rences)\s*',
+            '', bib_text, count=1, flags=re.IGNORECASE,
+        )
 
         # ── Extract APA-style references ──────────────────────────
         for i, m in enumerate(self._APA_REF.finditer(bib_text)):
-            authors_str, year_str, title = m.group(1), m.group(2), m.group(3)
+            author_block = m.group(1).strip()
+            year_str = m.group(2)
+            title = m.group(3).strip().rstrip('.')
+
+            # [FIX v1.1] Parse authors from the captured block using
+            # string functions — handles multi-author APA correctly.
+            authors = self._parse_author_block(author_block)
+
             doi_match = self._DOI.search(m.group(0))
             ref = ParsedReference(
                 raw_text=m.group(0).strip(),
-                authors=_extract_surnames(authors_str),
-                title=title.strip().rstrip('.'),
-                year=int(year_str),
+                authors=authors,
+                title=title,
+                year=int(year_str[:4]),
                 doi=doi_match.group(1) if doi_match else "",
                 position=i,
             )
@@ -337,14 +361,96 @@ class ReferenceExtractor:
                 refs.append(ref)
 
         # ── Extract inline citations from body ────────────────────
-        for m in self._INLINE_CITATION.finditer(body_text):
-            inline_cites.append(m.group(1).strip())
+        # [FIX v1.1] Two patterns: "(Smith, 2023)" AND "Smith (2023)"
+        seen_cites = set()
+        for m in self._INLINE_PAREN.finditer(body_text):
+            cite = m.group(1).strip()
+            if cite not in seen_cites:
+                inline_cites.append(cite)
+                seen_cites.add(cite)
+
+        for m in self._INLINE_AUTHOR_YEAR.finditer(body_text):
+            cite = f"{m.group(1).strip()}, {m.group(2)}"
+            if cite not in seen_cites:
+                inline_cites.append(cite)
+                seen_cites.add(cite)
 
         # ── Cross-reference: mark which bib refs have inline cites ─
         for ref in refs:
             ref.has_inline_citation = self._has_inline_match(ref, inline_cites, body_text)
 
         return refs, inline_cites
+
+    @staticmethod
+    def _parse_author_block(author_block: str) -> List[str]:
+        """
+        [FIX v1.1] Parse APA author block into list of surnames.
+
+        Handles: "Smith, J. A., Brown, B., & Davis, C."
+                 "Smith, J. A., Doe, B. C., Johnson, D., & White, E."
+                 "Smith, J."
+                 "Smith, J. et al."
+
+        Strategy: Split on "&" and "and" first, then split each segment
+        on comma-initial patterns to separate authors from initials.
+        """
+        # [FIX v1.2] Strip residual header words that may leak into the
+        # author block when bibliography header is inline with first ref.
+        _NON_AUTHOR_WORDS = {
+            'references', 'bibliography', 'works', 'cited', 'literature',
+            'bibliografía', 'bibliografia', 'références', 'referencias',
+        }
+
+        # Remove "et al."
+        cleaned = re.sub(r'\bet\s+al\.?', '', author_block, flags=re.IGNORECASE).strip()
+        # Remove trailing punctuation
+        cleaned = cleaned.rstrip('.,;& ')
+
+        # Split on " & " or " and " (inter-author separators)
+        segments = re.split(r'\s*(?:&|(?<!\w)and(?!\w))\s*', cleaned)
+
+        surnames = []
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
+                continue
+
+            # Each segment may contain multiple "Surname, Initials" pairs
+            # separated by commas. Key insight: initials are short parts
+            # containing periods or single uppercase letters.
+            parts = [p.strip() for p in seg.split(',') if p.strip()]
+
+            i = 0
+            while i < len(parts):
+                part = parts[i]
+                # Is this an initials-only part?
+                # Match: "J.", "J. A.", "A. B.", "J", "J. A", "A B"
+                is_initials = bool(re.match(
+                    r'^[A-Z]\.?(\s*[A-Z]\.?)*\s*$', part
+                )) and len(part.replace('.', '').replace(' ', '')) <= 4
+
+                if is_initials:
+                    # Skip initials — the surname was the previous part
+                    i += 1
+                    continue
+
+                # This looks like a surname
+                surname = re.sub(r'[^a-zA-Z\-]', '', part)
+                # [FIX v1.2] Skip known non-author words (header residue)
+                if len(surname) >= 2 and surname.lower() not in _NON_AUTHOR_WORDS:
+                    surnames.append(surname.lower())
+                    # Skip the next part if it looks like initials
+                    if i + 1 < len(parts):
+                        next_part = parts[i + 1].strip()
+                        next_is_init = (
+                            bool(re.match(r'^[A-Z]\.?(\s*[A-Z]\.?)*\s*$', next_part))
+                            and len(next_part.replace('.', '').replace(' ', '')) <= 4
+                        )
+                        if next_is_init:
+                            i += 1  # consume initials
+                i += 1
+
+        return surnames
 
     @staticmethod
     def _has_inline_match(ref: ParsedReference, inline_cites: List[str],
@@ -556,7 +662,7 @@ def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, L
     # ── Title similarity ──────────────────────────────────────────
     ref_title = _normalize_text(ref.title)
     cand_title = _normalize_text(candidate.get("title", ""))
-    title_sim = _levenshtein_ratio(ref_title, cand_title) if ref_title and cand_title else 0.0
+    title_sim = _similarity_ratio(ref_title, cand_title) if ref_title and cand_title else 0.0
     score += title_sim * 40  # title worth 40 points
 
     if title_sim < 0.5:
@@ -602,7 +708,7 @@ def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, L
     ref_journal = _normalize_text(ref.journal)
     cand_journal = _normalize_text(candidate.get("journal", ""))
     if ref_journal and cand_journal:
-        journal_sim = _levenshtein_ratio(ref_journal, cand_journal)
+        journal_sim = _similarity_ratio(ref_journal, cand_journal)
         score += journal_sim * 15  # journal worth 15 points
         if journal_sim < 0.5:
             issues.append(f"Journal mismatch (similarity: {journal_sim:.0%})")
@@ -871,7 +977,7 @@ class ReferenceValidator:
         if best_meta:
             ref_title_n = _normalize_text(ref.title)
             cand_title_n = _normalize_text(best_meta.get("title", ""))
-            title_sim = _levenshtein_ratio(ref_title_n, cand_title_n)
+            title_sim = _similarity_ratio(ref_title_n, cand_title_n)
             ref_authors = set(ref.authors)
             cand_authors = set(best_meta.get("authors", []))
             if ref_authors and cand_authors:

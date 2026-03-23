@@ -32,6 +32,8 @@ Plugin call map
   ReasoningProfiler             .vectorize(text), .feature_names()
   PerplexityProfiler            .compute_stats(text)  [NEW v3.7]
   PerplexityRiskClassifier      .classify(stats)      [NEW v3.7]
+  ReferenceValidator            .compute_stats(text)  [NEW v3.8]
+  ReferenceRiskClassifier       .classify(stats)      [NEW v3.8]
   WatermarkDecoder              .detect(text) -> .to_forensic_dict()
   ForensicReportGenerator       .generate_report(...) -> .export_html/json()
 
@@ -98,6 +100,7 @@ class PluginConfig:
     enable_hallucination:   bool = True
     enable_reasoning:       bool = True
     enable_perplexity:      bool = True     # [NEW v3.7] Perplexity profiler
+    enable_reference_check: bool = False    # [NEW v3.8] Reference validator (requires network)
     enable_watermark:       bool = False
     enable_forensic_report: bool = True
     forensic_output_path:   str  = "forensic_report.html"
@@ -105,6 +108,7 @@ class PluginConfig:
     watermark_device:       Optional[str] = None
     perplexity_dict_path:   Optional[str] = None   # [NEW v3.7] Pre-built n-gram dict
     perplexity_tier2:       bool = True             # [NEW v3.7] Auto-enable GPT-2
+    reference_network:      bool = True             # [NEW v3.8] Enable API calls for refs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -155,6 +159,8 @@ class PluginOrchestrator:
         self._reasoning_classifier:     Any = None      # [NEW v3.5]
         self._perplexity_profiler:      Any = None      # [NEW v3.7]
         self._perplexity_classifier:    Any = None      # [NEW v3.7]
+        self._reference_validator:      Any = None      # [NEW v3.8]
+        self._reference_classifier:     Any = None      # [NEW v3.8]
         self._watermark_decoder:        Any = None
         self._forensic_generator:       Any = None
         self._init_plugins()
@@ -223,6 +229,19 @@ class PluginOrchestrator:
                 logger.info("PerplexityProfiler loaded (%s)", tier)
             except ImportError as exc:
                 logger.warning("PerplexityProfiler unavailable: %s", exc)
+
+        # [NEW v3.8] ReferenceValidator + ReferenceRiskClassifier
+        if cfg.enable_reference_check:
+            try:
+                from reference_validator import ReferenceValidator, ReferenceRiskClassifier
+                self._reference_validator = ReferenceValidator(
+                    enable_network=cfg.reference_network,
+                )
+                self._reference_classifier = ReferenceRiskClassifier()
+                mode = "online (API)" if cfg.reference_network else "offline (heuristic)"
+                logger.info("ReferenceValidator loaded (%s)", mode)
+            except ImportError as exc:
+                logger.warning("ReferenceValidator unavailable: %s", exc)
 
         if cfg.enable_forensic_report:
             try:
@@ -345,6 +364,27 @@ class PluginOrchestrator:
             except Exception as exc:
                 logger.warning("PerplexityProfiler.compute_stats() failed: %s", exc)
 
+        # ── ReferenceValidator [NEW v3.8] ─────────────────────────────
+        if self._reference_validator is not None:
+            try:
+                ref_stats = self._reference_validator.compute_stats(text)
+
+                if self._reference_classifier is not None:
+                    ref_analysis = self._reference_classifier.classify(ref_stats)
+                    additional["references"] = ref_analysis
+                else:
+                    additional["references"] = ref_stats
+
+                total_refs = int(ref_stats.get("total_references", 0))
+                logger.debug(
+                    "References: %d found, score=%.4f level=%s",
+                    total_refs,
+                    additional["references"].get("ai_score", 0.0),
+                    additional["references"].get("risk_level", "N/A"),
+                )
+            except Exception as exc:
+                logger.warning("ReferenceValidator.compute_stats() failed: %s", exc)
+
         # ── WatermarkDecoder ──────────────────────────────────────────
         if self._watermark_decoder is not None:
             try:
@@ -423,6 +463,7 @@ class PluginOrchestrator:
         if self._reasoning_profiler     is not None: active.append("ReasoningProfiler")
         if self._reasoning_classifier   is not None: active.append("ReasoningRiskClassifier")
         if self._perplexity_profiler    is not None: active.append("PerplexityProfiler")
+        if self._reference_validator    is not None: active.append("ReferenceValidator")
         if self._watermark_decoder      is not None: active.append("WatermarkDecoder")
         if self._forensic_generator     is not None: active.append("ForensicReportGenerator")
         return active
@@ -475,6 +516,20 @@ class PluginOrchestrator:
                 f"    ppl_mean={ppl.get('feature_values',{}).get('proxy_perplexity_mean',0):.2f}  "
                 f"entropy={ppl.get('feature_values',{}).get('token_entropy_mean',0):.2f}  "
                 f"windows={ppl.get('window_count',0)}"]
+
+        refs = aa.get("references")
+        if refs:
+            total = refs.get("total_references", 0)
+            lines += ["", "  References:",
+                f"    score={refs.get('ai_score',0):.4f}  level={refs.get('risk_level','N/A')}  "
+                f"total={total}"]
+            if total > 0:
+                vrs = refs.get("validation_results", [])
+                verified = sum(1 for v in vrs if v.get("status") == "verified")
+                fabricated = sum(1 for v in vrs if v.get("status") == "not_found")
+                chimeric = sum(1 for v in vrs if v.get("is_chimeric"))
+                lines.append(
+                    f"    verified={verified}  fabricated={fabricated}  chimeric={chimeric}")
 
         wm = aa.get("watermark")
         if wm:
