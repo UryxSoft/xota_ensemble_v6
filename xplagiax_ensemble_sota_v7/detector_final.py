@@ -547,6 +547,83 @@ class ConformalCalibrator:
         return o
 
 
+# Minimum number of calibration humans needed to trust a per-group threshold.
+# The finest FPR a conformal set of n humans can guarantee is ~1/(n+1); to
+# guarantee 1% we need n >= ~100. Below this we fall back to the global
+# calibrator so we never *loosen* the guarantee on a thin subgroup.
+MIN_GROUP_CALIB = 100
+
+
+class GroupedConformalCalibrator:
+    """Per-subgroup split-conformal thresholds (e.g. one per language/domain).
+
+    The global conformal guarantee only holds under *exchangeability*: future
+    humans must look like the calibration humans. A single global threshold
+    silently breaks this for under-represented subgroups (the non-native-English
+    false-positive problem). This class fits an INDEPENDENT threshold per
+    subgroup so the FPR<=alpha guarantee holds *within each group*, and falls
+    back to the global threshold whenever a group is too small to calibrate
+    honestly (n < MIN_GROUP_CALIB).
+    """
+
+    def __init__(self, target_fpr: float = DEFAULT_TARGET_FPR):
+        self.target_fpr = target_fpr
+        self.global_cal = ConformalCalibrator(target_fpr)
+        self.groups: Dict[str, ConformalCalibrator] = {}
+        self.group_sizes: Dict[str, int] = {}
+
+    def fit(self, human_scores: np.ndarray, groups: np.ndarray,
+            global_human_scores: Optional[np.ndarray] = None
+            ) -> "GroupedConformalCalibrator":
+        """Fit one calibrator per group key present in `groups`.
+
+        human_scores[i] is P(AI) for a calibration HUMAN whose subgroup is
+        groups[i]. `global_human_scores` (default = all human_scores) fits the
+        fallback. A group is only given its own threshold if it has at least
+        MIN_GROUP_CALIB humans; otherwise queries for it use the global one.
+        """
+        gh = global_human_scores if global_human_scores is not None else human_scores
+        self.global_cal.fit(np.asarray(gh, dtype=np.float64))
+
+        groups = np.asarray(groups)
+        human_scores = np.asarray(human_scores, dtype=np.float64)
+        for key in np.unique(groups):
+            mask = groups == key
+            n = int(mask.sum())
+            self.group_sizes[str(key)] = n
+            if n >= MIN_GROUP_CALIB:
+                self.groups[str(key)] = ConformalCalibrator(
+                    self.target_fpr).fit(human_scores[mask])
+        return self
+
+    def calibrator_for(self, group: Optional[str]) -> ConformalCalibrator:
+        """Return the group's calibrator, or the global fallback."""
+        if group is not None and str(group) in self.groups:
+            return self.groups[str(group)]
+        return self.global_cal
+
+    def decide(self, p_ai: float, group: Optional[str] = None) -> str:
+        return self.calibrator_for(group).decide(p_ai)
+
+    def to_dict(self) -> dict:
+        return {
+            "target_fpr": self.target_fpr,
+            "global": self.global_cal.to_dict(),
+            "groups": {k: v.to_dict() for k, v in self.groups.items()},
+            "group_sizes": self.group_sizes,
+            "min_group_calib": MIN_GROUP_CALIB,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GroupedConformalCalibrator":
+        o = cls(d.get("target_fpr", DEFAULT_TARGET_FPR))
+        o.global_cal = ConformalCalibrator.from_dict(d["global"])
+        o.groups = {k: ConformalCalibrator.from_dict(v)
+                    for k, v in d.get("groups", {}).items()}
+        o.group_sizes = d.get("group_sizes", {})
+        return o
+
+
 # =====================================================================
 # 6. ORCHESTRATOR
 # =====================================================================
@@ -578,10 +655,20 @@ class SOTADetector:
         self.supervised = SupervisedBranch(ensemble_dir, device=device)
         self.zeroshot = ZeroShotBranch(device=device) if enable_zeroshot else None
         self.meta = MetaLearner.load(os.path.join(ensemble_dir, "meta_learner.pkl"))
+        # Prefer per-subgroup conformal (conformal_grouped.json) when present;
+        # it keeps the FPR guarantee valid per language/domain. Fall back to the
+        # single global threshold, then to a safe abstaining default.
+        grouped_path = os.path.join(ensemble_dir, "conformal_grouped.json")
         cal_path = os.path.join(ensemble_dir, "conformal.json")
-        self.conformal = (ConformalCalibrator.from_dict(json.load(open(cal_path)))
-                          if os.path.exists(cal_path)
-                          else ConformalCalibrator(target_fpr))
+        if os.path.exists(grouped_path):
+            self.grouped = GroupedConformalCalibrator.from_dict(
+                json.load(open(grouped_path)))
+            self.conformal = self.grouped.global_cal
+        else:
+            self.grouped = None
+            self.conformal = (ConformalCalibrator.from_dict(json.load(open(cal_path)))
+                              if os.path.exists(cal_path)
+                              else ConformalCalibrator(target_fpr))
 
     # ---- feature assembly (shared with trainer.py) ----
     def feature_names(self) -> List[str]:
@@ -604,7 +691,14 @@ class SOTADetector:
         return feats, mc, p_ai_sup
 
     # ---- single text ----
-    def classify(self, text: str) -> Verdict:
+    def classify(self, text: str, group: Optional[str] = None) -> Verdict:
+        """Classify one text.
+
+        `group` (e.g. the language / domain) routes the decision to a
+        subgroup-specific conformal threshold when one was calibrated, so the
+        FPR<=alpha guarantee holds *within that group*. If no per-group
+        calibrator exists for it, the global threshold is used (and flagged).
+        """
         clean, tamper = canonicalize_text(text)
         n_words = len(_WORD_RE.findall(clean))
 
@@ -615,8 +709,13 @@ class SOTADetector:
         feats, mc, p_ai_sup = self.assemble_features(clean)
         p_ai = float(self.meta.predict_proba_ai(feats.reshape(1, -1))[0])
 
-        verdict = self.conformal.decide(p_ai)
         flags: List[str] = []
+        if self.grouped is not None:
+            verdict = self.grouped.decide(p_ai, group)
+            if group is not None and str(group) not in self.grouped.groups:
+                flags.append("group_fallback_global")  # FPR not group-calibrated
+        else:
+            verdict = self.conformal.decide(p_ai)
 
         # Tampering is itself evidence of evasion: never clear a tampered text
         # as HUMAN; surface it for human review.
@@ -698,7 +797,8 @@ class SOTADetector:
 __all__ = [
     "canonicalize_text", "TamperReport", "StylometricExtractor",
     "ZeroShotBranch", "SupervisedBranch", "MetaLearner",
-    "ConformalCalibrator", "SOTADetector", "Verdict",
+    "ConformalCalibrator", "GroupedConformalCalibrator", "MIN_GROUP_CALIB",
+    "SOTADetector", "Verdict",
     "LABEL_ORDER", "HUMAN_IDX", "NUM_LABELS",
 ]
 

@@ -46,7 +46,8 @@ import numpy as np
 from detector_final import (
     LABEL_ORDER, HUMAN_IDX, NUM_LABELS, SHORT_LONG_BOUNDARY,
     StylometricExtractor, SupervisedBranch, ZeroShotBranch,
-    MetaLearner, ConformalCalibrator, canonicalize_text, _CONFUSABLES,
+    MetaLearner, ConformalCalibrator, GroupedConformalCalibrator,
+    canonicalize_text, _CONFUSABLES,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -355,7 +356,7 @@ def fit_meta_and_conformal(out_dir: str, val_rows: List[dict],
     feat_names = (["p_ai_supervised", "zeroshot_score"]
                   + [f"style_{f}" for f in StylometricExtractor.FEATURES])
 
-    X, y = [], []
+    X, y, grp = [], [], []
     for r in val_rows:
         t, _ = canonicalize_text(str(r["text"]))
         mc = supervised.predict(t)
@@ -364,7 +365,8 @@ def fit_meta_and_conformal(out_dir: str, val_rows: List[dict],
         vec = np.concatenate([[p_sup, z], style.vectorize(t)])
         X.append(np.nan_to_num(vec, nan=0.0))
         y.append(0 if r["label"] == "Human" else 1)
-    X = np.array(X, dtype=np.float64); y = np.array(y)
+        grp.append(r.get("domain") or "unknown")   # 'idiom' lands here
+    X = np.array(X, dtype=np.float64); y = np.array(y); grp = np.array(grp)
 
     meta = MetaLearner().fit(X, y, feat_names)
     meta.save(os.path.join(out_dir, "meta_learner.pkl"))
@@ -372,11 +374,29 @@ def fit_meta_and_conformal(out_dir: str, val_rows: List[dict],
 
     p_ai = meta.predict_proba_ai(X)
     human_scores = p_ai[y == 0]
-    ai_scores = p_ai[y == 1]
-    conf = ConformalCalibrator(target_fpr).fit(human_scores, ai_scores)
+
+    # Global conformal threshold (depends ONLY on human scores).
+    conf = ConformalCalibrator(target_fpr).fit(human_scores)
     json.dump(conf.to_dict(), open(os.path.join(out_dir, "conformal.json"), "w"),
               indent=2)
-    logger.info("  conformal thresholds: %s", conf.to_dict())
+    logger.info("  global conformal thresholds: %s", conf.to_dict())
+
+    # Per-subgroup conformal thresholds (one per language/domain) so the
+    # FPR<=alpha guarantee holds within each group — closing the exchangeability
+    # gap (non-native-English false positives). Thin groups fall back to global.
+    human_groups = grp[y == 0]
+    grouped = GroupedConformalCalibrator(target_fpr).fit(
+        human_scores, human_groups, global_human_scores=human_scores)
+    json.dump(grouped.to_dict(),
+              open(os.path.join(out_dir, "conformal_grouped.json"), "w"), indent=2)
+    n_calibrated = len(grouped.groups)
+    logger.info("  per-group conformal: %d/%d groups got their own threshold "
+                "(>= %d humans); rest use global fallback.",
+                n_calibrated, len(grouped.group_sizes),
+                __import__("detector_final").MIN_GROUP_CALIB)
+    for gk, cal in grouped.groups.items():
+        logger.info("    [%-12s] n=%d  tau_ai=%.4f",
+                    gk, grouped.group_sizes[gk], cal.tau_ai)
 
 
 # =====================================================================
@@ -384,29 +404,65 @@ def fit_meta_and_conformal(out_dir: str, val_rows: List[dict],
 # =====================================================================
 
 def load_rows(data_path: str, text_col="text", label_col="label",
+              domain_col: Optional[str] = None,
               limit: Optional[int] = None) -> List[dict]:
-    """Load rows from parquet/jsonl/csv via datasets or pandas."""
+    """Load rows from parquet/jsonl/csv.
+
+    Supports the user's native column names automatically:
+      text_col   — default "text"
+      label_col  — default "label"; also tries "model", "target_model" as fallback
+      domain_col — default None; also tries "idiom", "domain", "source" as fallback
+    """
+    # Label column fallback order: explicit > "model" > "target_model" > "label"
+    _label_candidates = [label_col, "model", "target_model", "label"]
+    # Domain column fallback order: explicit > "idiom" > "domain" > "source"
+    _domain_candidates = ([domain_col] if domain_col else []) + ["idiom", "domain", "source"]
+
     rows: List[dict] = []
     try:
-        from datasets import load_dataset
-        ext = "parquet" if data_path.endswith((".parquet",)) or \
-            os.path.isdir(data_path) else \
-            "json" if data_path.endswith((".json", ".jsonl")) else "csv"
-        ds = load_dataset(ext, data_files=data_path if not os.path.isdir(data_path)
-                          else None, data_dir=data_path if os.path.isdir(data_path)
-                          else None, split="train")
-        for ex in ds:
-            lbl = unify_label(ex.get(label_col) or ex.get("target_model", ""))
+        import pandas as pd
+        if os.path.isdir(data_path):
+            import glob as _glob
+            files = _glob.glob(os.path.join(data_path, "*.parquet"))
+            dfs = [pd.read_parquet(f) for f in sorted(files)]
+            df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        elif data_path.endswith((".parquet",)):
+            df = pd.read_parquet(data_path)
+        elif data_path.endswith((".json", ".jsonl")):
+            df = pd.read_json(data_path, lines=data_path.endswith(".jsonl"))
+        else:
+            df = pd.read_csv(data_path)
+
+        # Resolve actual column names present in the file
+        cols = set(df.columns)
+        actual_label = next((c for c in _label_candidates if c in cols), None)
+        actual_domain = next((c for c in _domain_candidates if c in cols), None)
+
+        if actual_label is None:
+            raise ValueError(f"No label column found. Tried: {_label_candidates}. "
+                             f"Available: {list(cols)}")
+        if actual_label != label_col:
+            logger.info("Using '%s' as label column (tried '%s' first)",
+                        actual_label, label_col)
+        if actual_domain:
+            logger.info("Using '%s' as domain/group column", actual_domain)
+
+        for _, ex in df.iterrows():
+            lbl = unify_label(str(ex.get(actual_label, "")))
             if lbl is None:
                 continue
-            rows.append({"text": ex.get(text_col, ""), "label": lbl,
-                         "source": ex.get("source"), "domain": ex.get("domain"),
-                         "group_id": ex.get("group_id")})
+            rows.append({
+                "text":     str(ex.get(text_col, "")),
+                "label":    lbl,
+                "domain":   str(ex[actual_domain]) if actual_domain else None,
+                "source":   data_path,
+                "group_id": ex.get("group_id"),
+            })
             if limit and len(rows) >= limit:
                 break
     except Exception as e:
         raise SystemExit(f"Failed to load data from {data_path}: {e}")
-    logger.info("Loaded %d labeled rows", len(rows))
+    logger.info("Loaded %d labeled rows from %s", len(rows), data_path)
     return rows
 
 
@@ -416,7 +472,7 @@ def load_rows(data_path: str, text_col="text", label_col="label",
 
 def main():
     ap = argparse.ArgumentParser(description="Train xplagiax_ensemble_sota_v7")
-    ap.add_argument("--data", required=True, help="parquet/jsonl/csv or dir")
+    ap.add_argument("--data", required=True, help="parquet/jsonl/csv or dir of parquets")
     ap.add_argument("--out", default="./sota_v7_artifacts")
     ap.add_argument("--models", default="modernbert,deberta")
     ap.add_argument("--length-experts", action="store_true",
@@ -425,10 +481,18 @@ def main():
     ap.add_argument("--target-fpr", type=float, default=0.01)
     ap.add_argument("--no-zeroshot", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--text-col", default="text",
+                    help="column name for the text field (default: text)")
+    ap.add_argument("--label-col", default="label",
+                    help="column for label/model; auto-tries 'model','target_model' (default: label)")
+    ap.add_argument("--domain-col", default=None,
+                    help="column for language/domain grouping; auto-tries 'idiom','domain' (default: auto)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    rows = load_rows(args.data, limit=args.limit)
+    rows = load_rows(args.data, text_col=args.text_col,
+                     label_col=args.label_col, domain_col=args.domain_col,
+                     limit=args.limit)
     train, val, test = dedup_and_split(rows)
     json.dump({"n_train": len(train), "n_val": len(val), "n_test": len(test)},
               open(os.path.join(args.out, "split_sizes.json"), "w"), indent=2)

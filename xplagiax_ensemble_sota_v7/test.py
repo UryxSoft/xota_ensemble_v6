@@ -165,7 +165,9 @@ def score_rows(detector: SOTADetector, rows: List[dict],
     y, p, pred = [], [], []
     for r in rows:
         text = transform(str(r["text"]))
-        v = detector.classify(text)
+        # Route to the per-subgroup conformal threshold when the row carries a
+        # domain/idiom, so the reported FPR reflects the deployed group policy.
+        v = detector.classify(text, group=r.get("domain"))
         y.append(0 if r["label"] == "Human" else 1)
         p.append(v.p_ai)
         # INCONCLUSIVE/TAMPERED count as "not a confident human-clear":
